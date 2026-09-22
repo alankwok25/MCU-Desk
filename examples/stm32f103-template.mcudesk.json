@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "STM32F103C8 · 普通应用模板",
+  "chip": "STM32F103C8",
+  "elf": "",
+  "image": "",
+  "backend": "daplink",
+  "mode": "ARM SWD",
+  "speed": "1 MHz",
+  "target_config": "target/stm32f1x.cfg",
+  "flash_ranges": [[134217728, 134283264]],
+  "protected_ranges": [],
+  "reset_after_flash": true,
+  "watches": []
+}

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "name": "Cortex-M · 自定义芯片模板",
+  "chip": "",
+  "elf": "",
+  "image": "",
+  "backend": "daplink",
+  "mode": "ARM SWD",
+  "speed": "1 MHz",
+  "target_config": "",
+  "flash_ranges": [],
+  "protected_ranges": [],
+  "watches": []
+}
