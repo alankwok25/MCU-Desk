@@ -14,6 +14,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets as W
 from PyQt5.QtCore import Qt
 
 from mcu_desk import McuDeskBase, Valuable
+from version import __version__
 from symbols import SymbolIndex
 from projects import defaults, load_project, save_project, validate_ranges
 from dock_workspace import DockWorkspace
@@ -77,6 +78,104 @@ def choose_file(edit, caption, pattern):
         edit.setText(path)
 
 
+class ConfigSelector(W.QComboBox):
+    textChanged = QtCore.pyqtSignal(str)
+
+    def __init__(self, value='', parent=None):
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setInsertPolicy(W.QComboBox.NoInsert)
+        self.setEditText(value)
+        self.editTextChanged.connect(self.textChanged.emit)
+
+    def text(self):
+        return self.currentText()
+
+    def setText(self, value):
+        self.setEditText(value)
+
+    def setPlaceholderText(self, value):
+        self.lineEdit().setPlaceholderText(value)
+
+    def populate(self, names):
+        selected = self.text()
+        blocker = QtCore.QSignalBlocker(self)
+        self.clear()
+        self.addItems(names)
+        self.setEditText(selected)
+        del blocker
+        complete = W.QCompleter(self.model(), self)
+        complete.setCaseSensitivity(Qt.CaseInsensitive)
+        complete.setFilterMode(Qt.MatchContains)
+        complete.setCompletionMode(W.QCompleter.PopupCompletion)
+        self.setCompleter(complete)
+
+
+def find_openocd_scripts(executable):
+    if not executable or not Path(executable).is_file():
+        return ''
+    base = Path(executable).resolve().parent
+    for root in (base, base.parent):
+        for relative in ('scripts', 'share/openocd/scripts', 'openocd/scripts'):
+            candidate = root / relative
+            if (candidate / 'target').is_dir():
+                return str(candidate)
+    return ''
+
+
+class OpenOCDConfigFields(QtCore.QObject):
+    """Shared discovery for both dialogs; never replace a selected target."""
+    def __init__(self, fields, form, parent):
+        super().__init__(parent)
+        self.fields = fields
+        self.auto_scripts = find_openocd_scripts(fields['openocd'].text().strip())
+        self.notice = W.QLabel()
+        self.notice.setWordWrap(True)
+        form.addRow(self.notice)
+        fields['openocd'].editingFinished.connect(self.refresh)
+        # File browsing also changes the path without editingFinished.
+        fields['openocd'].textChanged.connect(self.refresh)
+        fields['scripts_dir'].textChanged.connect(self.refresh)
+        self.refresh()
+
+    def refresh(self, *args):
+        scripts = self.fields['scripts_dir']
+        chosen = scripts.text().strip()
+        detected = find_openocd_scripts(self.fields['openocd'].text().strip())
+        if not chosen or chosen == self.auto_scripts:
+            chosen = detected
+            blocker = QtCore.QSignalBlocker(scripts)
+            scripts.setText(chosen)
+            del blocker
+        self.auto_scripts = detected
+        names = []
+        error = ''
+        if chosen:
+            try:
+                names = sorted(p.relative_to(Path(chosen)).as_posix()
+                               for p in (Path(chosen) / 'target').glob('*.cfg') if p.is_file())
+            except OSError as exc:
+                error = str(exc)
+        self.fields['target_config'].populate(names)
+        self.notice.setText(('已发现 %d 个芯片配置，可输入名称搜索；保留当前选择。' % len(names))
+                            if names else '未找到芯片配置列表，请选择 OpenOCD scripts 目录；也可手动选择配置文件。' + error)
+
+
+def directory_row(edit):
+    row = W.QWidget()
+    layout = W.QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.addWidget(edit, 1)
+    button = W.QPushButton('浏览…')
+    def choose():
+        path = W.QFileDialog.getExistingDirectory(edit, '选择 OpenOCD scripts 目录', edit.text())
+        if path:
+            edit.setText(path)
+    button.clicked.connect(choose)
+    layout.addWidget(button)
+    return row
+
+
 def regions_text(regions):
     return '\n'.join('0x%08X - 0x%08X' % (a, b) for a, b in regions)
 
@@ -132,13 +231,18 @@ class SettingsDialog(W.QDialog):
                            ('jlink_exe', 'J-Link 烧录程序（留空自动查找）'),
                            ('jlink_uid', 'J-Link 序列号（多探针时填写）'),
                            ('rtt_address', 'RTT 地址（可填“自动”）'), ('rtt_scan_start', 'RTT 默认扫描起点')]:
-            edit = ChipSelector(project, self) if key == 'chip' else W.QLineEdit(project.get(key, ''))
+            edit = (ChipSelector(project, self) if key == 'chip' else
+                    ConfigSelector(project.get(key, ''), self) if key == 'target_config' else
+                    W.QLineEdit(project.get(key, '')))
             self.fields[key] = edit
             dest = basic if key in ('name', 'chip', 'elf') else form
             if key in ('elf', 'openocd', 'target_config', 'interface_config', 'jlink_dll', 'jlink_exe'):
                 dest.addRow(label, browse_row(edit, label, '固件符号 (*.elf *.axf *.out)' if key == 'elf' else '所有文件 (*)'))
+            elif key == 'scripts_dir':
+                dest.addRow(label, directory_row(edit))
             else:
                 dest.addRow(label, edit)
+        self.openocd_fields = OpenOCDConfigFields(self.fields, form, self)
         self.fields['elf'].setPlaceholderText('监控结构体和变量时选择；只看 RTT 可留空')
         self.fields['jlink_dll'].setPlaceholderText('留空自动查找')
         self.fields['jlink_exe'].setPlaceholderText('留空自动查找')
@@ -220,6 +324,16 @@ class FlashDialog(W.QDialog):
         self.native = flash_engine(config) == 'jlink'
         layout = W.QVBoxLayout(self)
         form = W.QFormLayout()
+        self.probe = W.QComboBox()
+        self.probe.addItem('J-Link', ('jlink', '', 0))
+        for i, probe in enumerate(parent.daplinks):
+            self.probe.addItem('%s (%s)' % (probe.product_name, probe.unique_id),
+                               ('daplink', probe.unique_id, i + 2))
+        selected = next((i for i in range(self.probe.count())
+                         if self.probe.itemData(i)[:2] == (config['backend'], config.get('probe_uid', ''))), -1)
+        self.probe.setCurrentIndex(0 if config['backend'] == 'jlink' else selected)
+        self.probe.setPlaceholderText('请选择调试器；新接入的 DAPLink 请先在主界面刷新')
+        form.addRow('调试器', self.probe)
         self.chip = ChipSelector(config, self)
         form.addRow('芯片型号', self.chip)
         self.file = W.QLineEdit(config.get('image', '') or config.get('elf', ''))
@@ -229,6 +343,50 @@ class FlashDialog(W.QDialog):
         self.address_label = W.QLabel('BIN 起始地址')
         form.addRow(self.address_label, self.address)
         layout.addLayout(form)
+        self.jlink_exe = W.QLineEdit(config.get('jlink_exe', ''))
+        self.jlink_exe.setPlaceholderText('自动查找；找不到时选择 SEGGER 安装目录中的 JLink.exe')
+        self.jlink_row = browse_row(self.jlink_exe, '选择 J-Link 烧录程序', '程序 (*.exe)')
+        self.jlink_label = W.QLabel('J-Link 程序')
+        form.addRow(self.jlink_label, self.jlink_row)
+        self.advanced_toggle = W.QToolButton()
+        self.advanced_toggle.setText('高级设置（烧录工具、写入范围和保护区）')
+        self.advanced_toggle.setCheckable(True)
+        layout.addWidget(self.advanced_toggle)
+        advanced_content = W.QWidget()
+        advanced_form = W.QFormLayout(advanced_content)
+        self.fields = {}
+        for key, label in [('openocd', 'OpenOCD 程序'), ('target_config', '芯片配置文件'),
+                           ('interface_config', '探针配置（可选）'), ('scripts_dir', 'OpenOCD scripts 目录'),
+                           ('jlink_uid', 'J-Link 序列号（可选）')]:
+            value = config.get(key, '') or (shutil.which('openocd') or '' if key == 'openocd' else '')
+            edit = ConfigSelector(value, self) if key == 'target_config' else W.QLineEdit(value)
+            self.fields[key] = edit
+            advanced_form.addRow(label, browse_row(edit, label, '所有文件 (*)')
+                                 if key in ('openocd', 'target_config', 'interface_config') else
+                                 directory_row(edit) if key == 'scripts_dir' else edit)
+        self.openocd_fields = OpenOCDConfigFields(self.fields, advanced_form, self)
+        self.reset_config = W.QComboBox()
+        for label, value in [('无硬件复位线（none）', 'none'),
+                             ('硬件复位（需连接 NRST）', 'srst_only'),
+                             ('复位下连接（需连接 NRST）', 'srst_only srst_nogate connect_assert_srst')]:
+            self.reset_config.addItem(label, value)
+        self.reset_config.setCurrentIndex(max(0, self.reset_config.findData(config.get('reset_config', 'none'))))
+        advanced_form.addRow('复位接线配置', self.reset_config)
+        self.allowed = W.QPlainTextEdit(regions_text(config['flash_ranges']))
+        self.protected = W.QPlainTextEdit(regions_text(config['protected_ranges']))
+        for edit in (self.allowed, self.protected):
+            edit.setMaximumHeight(65)
+            edit.setPlaceholderText('每行：0x08000000 - 0x08010000（结束地址不包含在范围内）')
+        advanced_form.addRow('允许写入范围（可选）', self.allowed)
+        advanced_form.addRow('保护区（可选）', self.protected)
+        self.advanced = W.QScrollArea()
+        self.advanced.setWidgetResizable(True)
+        self.advanced.setWidget(advanced_content)
+        self.advanced.setMinimumHeight(220)
+        self.advanced.hide()
+        layout.addWidget(self.advanced)
+        self.advanced_toggle.toggled.connect(self.advanced.setVisible)
+        self.advanced_toggle.toggled.connect(self.preview)
         self.summary = W.QPlainTextEdit()
         self.summary.setReadOnly(True)
         layout.addWidget(self.summary)
@@ -239,11 +397,9 @@ class FlashDialog(W.QDialog):
         self.reset.toggled.connect(self.resume.setEnabled)
         layout.addWidget(self.reset)
         layout.addWidget(self.resume)
-        note = W.QLabel(('使用 SEGGER J-Link 烧录并校验，无需 OpenOCD 配置。擦除按芯片扇区执行，扇区内其他数据可能受影响。'
-                        if self.native else '使用 OpenOCD 读取并保留受影响扇区中的其他字节，再写入并校验。') +
-                       '\n烧录期间暂停监控；请核对固件的写入地址，尤其是 Bootloader / A/B 工程。')
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        self.note = W.QLabel()
+        self.note.setWordWrap(True)
+        layout.addWidget(self.note)
         buttons = W.QDialogButtonBox(W.QDialogButtonBox.Cancel)
         self.start = buttons.addButton('开始烧录', W.QDialogButtonBox.AcceptRole)
         self.start.setObjectName('primary')
@@ -253,6 +409,13 @@ class FlashDialog(W.QDialog):
         self.file.textChanged.connect(self.preview)
         self.address.textChanged.connect(self.preview)
         self.chip.textChanged.connect(self.preview)
+        self.probe.currentIndexChanged.connect(self.preview)
+        self.jlink_exe.textChanged.connect(self.preview)
+        for edit in self.fields.values():
+            edit.textChanged.connect(self.preview)
+        self.allowed.textChanged.connect(self.preview)
+        self.protected.textChanged.connect(self.preview)
+        self.reset_config.currentIndexChanged.connect(self.preview)
         self.preview()
 
     def preview(self):
@@ -261,9 +424,42 @@ class FlashDialog(W.QDialog):
         self.address.setVisible(is_bin)
         self.address_label.setVisible(is_bin)
         try:
+            self.config.update({key: edit.text().strip() for key, edit in self.fields.items()})
+            self.config['reset_config'] = self.reset_config.currentData()
+            self.config['jlink_exe'] = self.jlink_exe.text().strip()
+            self.config['flash_ranges'] = parse_regions(self.allowed.toPlainText())
+            self.config['protected_ranges'] = parse_regions(self.protected.toPlainText())
+            selected = self.probe.currentData()
+            if selected is None:
+                raise ValueError('请选择 J-Link 或已检测到的 DAPLink；无需先保存工程。')
+            backend, uid, _ = selected
+            self.config.update(backend=backend, probe_uid=self.config['jlink_uid'] if backend == 'jlink' else uid)
+            self.native = flash_engine(self.config) == 'jlink'
+            self.note.setText(('使用 J-Link 烧录并校验；擦除按扇区执行，扇区内其他数据可能受影响。'
+                               if self.native else '使用 OpenOCD 保留受影响扇区的其他字节，并写入、校验。'
+                               + ('已配置保护区，保留原有保护规则。' if self.config['protected_ranges'] else ''))
+                              + '\n无需先保存工程；烧录期间暂停监控，请核对芯片和写入地址。')
+            commander_error = ''
+            if self.native:
+                try:
+                    self.config['jlink_exe'] = find_commander(self.config)
+                except ValueError:
+                    commander_error = '未找到 J-Link 烧录程序，请在上方选择 SEGGER 安装目录中的 JLink.exe。'
+            show_commander = self.native and (bool(commander_error) or self.advanced_toggle.isChecked())
+            self.jlink_label.setVisible(show_commander)
+            self.jlink_row.setVisible(show_commander)
+            if commander_error:
+                raise ValueError(commander_error)
+            if not self.native:
+                if not Path(self.config['openocd']).is_file():
+                    raise ValueError('请展开“高级设置”，选择有效的 OpenOCD 程序。')
+                if not self.config['target_config']:
+                    raise ValueError('请在“高级设置”填写芯片配置文件，例如 target/stm32f4x.cfg。')
             self.config['chip'] = self.chip.text().strip()
             if not self.config['chip']:
-                raise ValueError('请填写芯片完整型号，保存后无需重复输入')
+                raise ValueError('请填写芯片完整型号。')
+            if not self.file.text().strip():
+                raise ValueError('请选择 HEX / ELF / BIN 烧录文件，无需选择变量 ELF。')
             self.image = read_image(self.file.text().strip(), self.address.text().strip())
             validate_image(self.image, self.config['flash_ranges'], self.config['protected_ranges'])
             lines = ['芯片：' + (self.config['chip'] or '未填写'),
@@ -346,7 +542,7 @@ class Workbench(McuDeskBase):
         self.linFile.setText(str(Path.cwd() / 'capture.txt'))
 
     def build_workbench(self):
-        self.setWindowTitle('MCU Desk · 嵌入式调试工作台')
+        self.setWindowTitle(f'MCU Desk v{__version__} · 嵌入式调试工作台')
         available = W.QApplication.primaryScreen().availableGeometry()
         self.resize(min(1440, available.width() - 40), min(1000, available.height() - 80))
         # Reuse the existing widgets and acquisition lifecycle; replace their presentation.
@@ -882,6 +1078,8 @@ class Workbench(McuDeskBase):
                 self.linElf.setText(self.project['elf'])
                 self.load_elf()
             self.status.setText('工程设置已更新。请保存工程以便下次使用。')
+            return True
+        return False
 
     def load_elf(self):
         if not self.ready or self.session_state != 'idle' or self.loader is not None:
@@ -1290,32 +1488,14 @@ class Workbench(McuDeskBase):
     def prepare_flash(self):
         self.stop_probe_discovery()
         config = self.capture_project()
-        native = flash_engine(config) == 'jlink'
-        if native:
-            try:
-                config['jlink_exe'] = find_commander(config)
-            except ValueError as exc:
-                self.status.setText(str(exc))
-                self.append_status(str(exc))
-                self.edit_settings() if self.session_state == 'idle' else None
-                return
-        elif not config['chip'] or not config['target_config'] or not config['openocd']:
-            message = ('该工程配置了保护区，使用 OpenOCD 保留原有扇区保护规则。'
-                       if config['backend'] == 'jlink' else '')
-            self.status.setText(message + '请在工程设置中填写芯片型号、OpenOCD 程序和芯片配置文件。')
-            self.append_status(self.status.text())
-            self.edit_settings() if self.session_state == 'idle' else None
-            return
-        if config['backend'] == 'openocd':
-            W.QMessageBox.warning(self, '请选择探针', '烧录会启动独立的 OpenOCD。请先关闭已有 OpenOCD 服务，选择 DAPLink 或 J-Link。')
-            return
-        if config['backend'] == 'daplink' and not isinstance(self.cmbDLL.currentData(), int):
-            self.status.setText('请先连接并选择 DAPLink，再打开烧录。')
-            return
         dialog = FlashDialog(config, self)
         if dialog.exec() != W.QDialog.Accepted:
             return
-        self.project.update({k: dialog.config[k] for k in ('chip', 'image', 'bin_address', 'reset_after_flash')})
+        self.project.update({k: dialog.config[k] for k in (
+            'chip', 'image', 'bin_address', 'reset_after_flash', 'backend', 'probe_uid',
+            'jlink_uid', 'jlink_exe', 'openocd', 'target_config', 'interface_config',
+            'scripts_dir', 'reset_config', 'flash_ranges', 'protected_ranges')})
+        self.cmbDLL.setCurrentIndex(dialog.probe.currentData()[2])
         self.chip_label.setText('芯片：' + self.project['chip'])
         self.reconnect_after_flash = dialog.reset.isChecked() and dialog.resume.isChecked()
         config = dict(dialog.config)

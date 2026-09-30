@@ -196,8 +196,14 @@ class OpenOCD:
                     cancel.wait(0.1)
             if self.sock is None:
                 raise TimeoutError('OpenOCD 连接超时')
-        except Exception:
+        except Exception as exc:
+            try:
+                detail = self.diagnostic_log()
+            except Exception:
+                detail = ''
             self.close()
+            if detail and detail not in str(exc):
+                raise RuntimeError('%s\nOpenOCD 日志：\n%s' % (exc, detail)) from exc
             raise
 
     def check_cancelled(self):
@@ -244,6 +250,16 @@ class OpenOCD:
             result.extend(parse_sectors(text, bank, base, size))
         return result
 
+    def diagnostic_log(self):
+        if self.log is None:
+            return ''
+        # The child writes to this file directly; use a separate handle so its
+        # output offset is not changed while it is still running.
+        with open(self.log.name, 'rb') as stream:
+            stream.seek(0, 2)
+            stream.seek(max(0, stream.tell() - 12000))
+            return stream.read().decode('utf-8', 'replace').strip()
+
     def close(self):
         if self.sock is not None:
             self.sock.close()
@@ -262,11 +278,18 @@ def program_image(config, image, cancel, progress, server_factory=OpenOCD):
     validate_image(image, config.get('flash_ranges', []), config.get('protected_ranges', []))
     with tempfile.TemporaryDirectory(prefix='mcu-desk-flash-') as directory:
         server = None
+        stage = '连接探针'
         try:
-            progress(0, '连接芯片')
+            progress(0, stage)
             server = server_factory(config, directory, cancel)
+            stage = '复位并暂停芯片'
+            progress(0, stage)
             server.command('reset init')
+            server.command('wait_halt 3000', timeout=5)
+            stage = '读取 Flash 布局'
+            progress(0, stage)
             sectors = plan_sectors(image, server.sectors(), config.get('protected_ranges', []))
+            stage = '读取并保留扇区'
             prepared = []
             # Read every affected sector before any erase/write. Preserve holes and unrelated bytes.
             for i, (_, _, start, size) in enumerate(sectors):
@@ -280,14 +303,29 @@ def program_image(config, image, cancel, progress, server_factory=OpenOCD):
                 path.write_bytes(replacement)
                 prepared.append((start, path, original == replacement))
             for i, (start, path, unchanged) in enumerate(prepared):
+                stage = '写入并校验扇区 0x%08X' % start
                 server.check_cancelled()
                 progress(20 + int(75 * i / len(prepared)), '校验已有数据' if unchanged else '烧录扇区 0x%08X' % start)
                 if not unchanged:
                     server.command('flash write_image erase %s 0x%X bin' % (tcl_word(path), start))
                 server.command('verify_image %s 0x%X bin' % (tcl_word(path), start))
             if config.get('reset_after_flash'):
+                stage = '复位并运行'
                 server.command('reset run')
             progress(100, '烧录与校验成功' + ('，程序已运行' if config.get('reset_after_flash') else '，芯片保持暂停'))
+        except Exception as exc:
+            detail = ''
+            if server is not None:
+                try:
+                    detail = server.diagnostic_log()
+                except Exception:
+                    pass
+            message = '%s失败：%s' % (stage, exc)
+            if stage == '复位并暂停芯片' and not cancel.is_set():
+                message += '\n未执行擦写；请检查芯片配置及复位接线。硬件复位/复位下连接需要连接 NRST。'
+            if detail:
+                message += '\nOpenOCD 日志：\n' + detail
+            raise RuntimeError(message) from exc
         finally:
             if server is not None:
                 server.close()

@@ -13,9 +13,11 @@ def main():
 
     from PyQt5.QtWidgets import QApplication
     from workbench import Workbench
+    from version import __version__
 
     app = QApplication(sys.argv)
     app.setApplicationName('MCU Desk')
+    app.setApplicationVersion(__version__)
     window = Workbench(project_file=project_file)
     window.show()
     return app.exec()
